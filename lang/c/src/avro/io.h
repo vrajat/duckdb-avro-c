@@ -130,6 +130,23 @@ int avro_file_reader(const char *path, avro_file_reader_t * reader);
  */
 int avro_file_reader_memory(const char *buf, int64_t len,
 			avro_file_reader_t * reader);
+
+/*
+ * Reads exactly len bytes at offset into buf. Returns 0 on success, or an
+ * errno value (after avro_set_error) on failure. Block readers call it from
+ * several threads at once, so it must be thread-safe.
+ */
+typedef int (*avro_file_read_at_t)(void *ctx, int64_t offset, void *buf, int64_t len);
+
+/*
+ * Open an object container of file_size bytes through read_at, without
+ * holding the file in memory: the header is read from a prefix, the block
+ * index is built by reading the file in bounded windows, and each block
+ * reader reads only the block it selects. ctx must stay valid until the file
+ * reader and all block readers created from it have been closed.
+ */
+int avro_file_reader_streaming(avro_file_read_at_t read_at, void *ctx,
+			int64_t file_size, avro_file_reader_t * reader);
 int avro_file_reader_fp(FILE *fp, const char *path, int should_close,
 			avro_file_reader_t * reader);
 int avro_reader_reader(avro_reader_t reader_in,

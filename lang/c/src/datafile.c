@@ -53,6 +53,13 @@ struct avro_file_reader_t_ {
 	struct avro_file_block_descriptor_t *blocks;
 	size_t block_count;
 	size_t block_capacity;
+	/* Streaming readers: blocks are read through read_at, not from memory */
+	avro_file_read_at_t read_at;
+	void *read_ctx;
+	int64_t file_size;
+	/* The header prefix the streaming reader parsed (owned) */
+	char *prefix;
+	int64_t prefix_size;
 };
 
 struct avro_file_block_reader_t_ {
@@ -62,6 +69,9 @@ struct avro_file_block_reader_t_ {
 	int64_t objects_read;
 	int64_t objects_total;
 	int has_block;
+	/* Streaming readers: the selected block's bytes (owned, reused) */
+	char *buffer;
+	int64_t buffer_capacity;
 };
 
 struct avro_file_writer_t_ {
@@ -951,6 +961,236 @@ error_after_header:
 	return rval;
 }
 
+/* The header is parsed from a prefix of this size, doubled until it fits */
+#define STREAM_PREFIX_INITIAL (256 * 1024)
+/* The block index is built by reading the file in windows of this size */
+#define STREAM_INDEX_WINDOW (1024 * 1024)
+/* An Avro long is at most 10 bytes; a block header is two of them */
+#define STREAM_BLOCK_HEADER_MAX 20
+
+/*
+ * Decodes a zig-zag varint long from p. Returns 0 and sets *used, EAGAIN if
+ * avail ends inside the varint, or EILSEQ if it is longer than 10 bytes.
+ */
+static int stream_decode_long(const char *p, int64_t avail, int64_t *out, int64_t *used)
+{
+	uint64_t value = 0;
+	int64_t i;
+	for (i = 0; i < avail && i < 10; i++) {
+		uint8_t b = (uint8_t) p[i];
+		value |= (uint64_t) (b & 0x7F) << (7 * i);
+		if (!(b & 0x80)) {
+			*out = (int64_t) (value >> 1) ^ -(int64_t) (value & 1);
+			*used = i + 1;
+			return 0;
+		}
+	}
+	return i < 10 ? EAGAIN : EILSEQ;
+}
+
+/*
+ * Builds the block index of a streaming reader: walks the blocks from
+ * data_offset, reading each block's header and sync marker through read_at in
+ * windows of STREAM_INDEX_WINDOW bytes, and skipping its data.
+ */
+static int file_index_stream_blocks(avro_file_reader_t r, int64_t data_offset)
+{
+	char *window;
+	int64_t window_start = 0;
+	int64_t window_len = 0;
+	int64_t offset = data_offset;
+	char sync[16];
+	int rval = 0;
+
+	window = (char *) avro_malloc(STREAM_INDEX_WINDOW);
+	if (!window) {
+		avro_set_error("Cannot allocate Avro file index window");
+		return ENOMEM;
+	}
+
+	while (offset < r->file_size) {
+		int64_t need = r->file_size - offset < STREAM_BLOCK_HEADER_MAX ?
+			r->file_size - offset : STREAM_BLOCK_HEADER_MAX;
+		int64_t object_count;
+		int64_t block_size;
+		int64_t used_count;
+		int64_t used_size;
+		int64_t body_offset;
+		int64_t sync_offset;
+		const char *p;
+		int64_t avail;
+
+		if (offset < window_start || offset + need > window_start + window_len) {
+			window_start = offset;
+			window_len = r->file_size - offset < STREAM_INDEX_WINDOW ?
+				r->file_size - offset : STREAM_INDEX_WINDOW;
+			rval = r->read_at(r->read_ctx, window_start, window, window_len);
+			if (rval) {
+				avro_prefix_error("Cannot index file block: ");
+				goto done;
+			}
+		}
+		p = window + (offset - window_start);
+		avail = window_start + window_len - offset;
+
+		if (stream_decode_long(p, avail, &object_count, &used_count) ||
+		    stream_decode_long(p + used_count, avail - used_count, &block_size, &used_size)) {
+			avro_set_error("Cannot index file block header");
+			rval = EILSEQ;
+			goto done;
+		}
+		if (object_count <= 0 || block_size < 0) {
+			avro_set_error("Invalid Avro file block count or size");
+			rval = EILSEQ;
+			goto done;
+		}
+
+		body_offset = offset + used_count + used_size;
+		if (block_size > r->file_size - body_offset ||
+		    (int64_t) sizeof(sync) > r->file_size - body_offset - block_size) {
+			avro_set_error("Avro file block exceeds file size");
+			rval = EILSEQ;
+			goto done;
+		}
+		sync_offset = body_offset + block_size;
+		if (sync_offset >= window_start &&
+		    sync_offset + (int64_t) sizeof(sync) <= window_start + window_len) {
+			memcpy(sync, window + (sync_offset - window_start), sizeof(sync));
+		} else {
+			rval = r->read_at(r->read_ctx, sync_offset, sync, sizeof(sync));
+			if (rval) {
+				avro_prefix_error("Cannot index file block sync: ");
+				goto done;
+			}
+		}
+		if (memcmp(r->sync, sync, sizeof(r->sync)) != 0) {
+			avro_set_error("Incorrect sync bytes");
+			rval = EILSEQ;
+			goto done;
+		}
+
+		rval = file_add_block_descriptor(r, body_offset, block_size, object_count);
+		if (rval) {
+			goto done;
+		}
+		offset = sync_offset + sizeof(sync);
+	}
+
+done:
+	avro_free(window, STREAM_INDEX_WINDOW);
+	return rval;
+}
+
+int avro_file_reader_streaming(avro_file_read_at_t read_at, void *ctx,
+			int64_t file_size, avro_file_reader_t *reader)
+{
+	avro_file_reader_t r;
+	int64_t prefix_size;
+	int64_t data_offset;
+	int rval;
+
+	check_param(EINVAL, read_at, "read_at");
+	check_param(EINVAL, file_size >= 0, "file size");
+	check_param(EINVAL, reader, "reader");
+
+	r = (avro_file_reader_t) avro_new(struct avro_file_reader_t_);
+	if (!r) {
+		avro_set_error("Cannot allocate streaming file reader");
+		return ENOMEM;
+	}
+	memset(r, 0, sizeof(struct avro_file_reader_t_));
+	r->read_at = read_at;
+	r->read_ctx = ctx;
+	r->file_size = file_size;
+	r->block_reader = avro_reader_memory(0, 0);
+	r->codec = (avro_codec_t) avro_new(struct avro_codec_t_);
+	if (!r->block_reader || !r->codec) {
+		avro_set_error("Cannot allocate streaming file reader");
+		rval = ENOMEM;
+		goto error;
+	}
+
+	/* Parse the header from a prefix, doubling it until the header fits */
+	prefix_size = file_size < STREAM_PREFIX_INITIAL ? file_size : STREAM_PREFIX_INITIAL;
+	for (;;) {
+		r->prefix = (char *) avro_malloc(prefix_size ? prefix_size : 1);
+		if (!r->prefix) {
+			avro_set_error("Cannot allocate Avro file header buffer");
+			rval = ENOMEM;
+			goto error;
+		}
+		r->prefix_size = prefix_size ? prefix_size : 1;
+		if (prefix_size) {
+			rval = read_at(ctx, 0, r->prefix, prefix_size);
+			if (rval) {
+				avro_prefix_error("Cannot read file header: ");
+				goto error;
+			}
+		}
+		r->reader = avro_reader_memory(r->prefix, prefix_size);
+		if (!r->reader) {
+			rval = ENOMEM;
+			goto error;
+		}
+		avro_codec(r->codec, NULL);
+		rval = file_read_header(r->reader, &r->writers_schema, r->codec,
+				r->sync, sizeof(r->sync), &r->meta_iface, &r->meta);
+		if (rval == 0) {
+			break;
+		}
+		/* A truncated header looks like a malformed one; retry until the prefix is the whole file */
+		avro_reader_free(r->reader);
+		r->reader = NULL;
+		avro_codec_reset(r->codec);
+		avro_free(r->prefix, r->prefix_size);
+		r->prefix = NULL;
+		if (prefix_size == file_size) {
+			goto error;
+		}
+		prefix_size = prefix_size > file_size / 2 ? file_size : prefix_size * 2;
+	}
+
+	data_offset = avro_reader_tell(r->reader);
+	if (data_offset < 0 || data_offset > file_size) {
+		avro_set_error("Invalid Avro file header size");
+		rval = EILSEQ;
+		goto error_after_header;
+	}
+	rval = file_index_stream_blocks(r, data_offset);
+	if (rval) {
+		goto error_after_header;
+	}
+	/* Streaming readers are read through block readers only */
+	r->blocks_total = 0;
+
+	*reader = r;
+	return 0;
+
+error_after_header:
+	avro_schema_decref(r->writers_schema);
+	avro_value_decref(&r->meta);
+	avro_value_iface_decref(r->meta_iface);
+error:
+	if (r->reader) {
+		avro_reader_free(r->reader);
+	}
+	if (r->block_reader) {
+		avro_reader_free(r->block_reader);
+	}
+	if (r->codec) {
+		avro_codec_reset(r->codec);
+		avro_freet(struct avro_codec_t_, r->codec);
+	}
+	if (r->prefix) {
+		avro_free(r->prefix, r->prefix_size);
+	}
+	if (r->blocks) {
+		avro_free(r->blocks, r->block_capacity * sizeof(struct avro_file_block_descriptor_t));
+	}
+	avro_freet(struct avro_file_reader_t_, r);
+	return rval;
+}
+
 int avro_file_reader(const char *path, avro_file_reader_t * reader)
 {
 	FILE *fp;
@@ -1053,8 +1293,8 @@ int avro_file_reader_get_block_count(avro_file_reader_t reader, size_t *count)
 {
 	check_param(EINVAL, reader, "reader");
 	check_param(EINVAL, count, "count");
-	if (!reader->memory_buffer) {
-		avro_set_error("Block indexing is only available for memory file readers");
+	if (!reader->memory_buffer && !reader->read_at) {
+		avro_set_error("Block indexing is only available for memory and streaming file readers");
 		return EINVAL;
 	}
 	*count = reader->block_count;
@@ -1069,8 +1309,8 @@ int avro_file_block_reader_create(avro_file_reader_t reader,
 
 	check_param(EINVAL, reader, "reader");
 	check_param(EINVAL, block_reader, "block reader");
-	if (!reader->memory_buffer) {
-		avro_set_error("Block readers require a memory file reader");
+	if (!reader->memory_buffer && !reader->read_at) {
+		avro_set_error("Block readers require a memory or streaming file reader");
 		return EINVAL;
 	}
 
@@ -1118,7 +1358,31 @@ int avro_file_block_reader_select_block(avro_file_block_reader_t block_reader,
 	}
 
 	block = &block_reader->file_reader->blocks[block_index];
-	block_data = block_reader->file_reader->memory_buffer + block->data_offset;
+	if (block_reader->file_reader->memory_buffer) {
+		block_data = block_reader->file_reader->memory_buffer + block->data_offset;
+	} else {
+		/* Streaming: read just this block into the block reader's own buffer */
+		avro_file_reader_t fr = block_reader->file_reader;
+		if (block->data_size > block_reader->buffer_capacity) {
+			char *grown = (char *) avro_realloc(block_reader->buffer,
+					block_reader->buffer_capacity, block->data_size);
+			if (!grown) {
+				avro_set_error("Cannot allocate Avro file block buffer");
+				return ENOMEM;
+			}
+			block_reader->buffer = grown;
+			block_reader->buffer_capacity = block->data_size;
+		}
+		if (block->data_size > 0) {
+			rval = fr->read_at(fr->read_ctx, block->data_offset, block_reader->buffer,
+					block->data_size);
+			if (rval) {
+				avro_prefix_error("Cannot read Avro file block: ");
+				return rval;
+			}
+		}
+		block_data = block_reader->buffer;
+	}
 	rval = avro_codec_decode(block_reader->codec, (void *) block_data, block->data_size);
 	if (rval) {
 		avro_prefix_error("Cannot decode Avro file block: ");
@@ -1170,6 +1434,9 @@ int avro_file_block_reader_close(avro_file_block_reader_t block_reader)
 	avro_reader_free(block_reader->reader);
 	avro_codec_reset(block_reader->codec);
 	avro_freet(struct avro_codec_t_, block_reader->codec);
+	if (block_reader->buffer) {
+		avro_free(block_reader->buffer, block_reader->buffer_capacity);
+	}
 	avro_freet(struct avro_file_block_reader_t_, block_reader);
 	return 0;
 }
@@ -1378,6 +1645,9 @@ int avro_file_reader_close(avro_file_reader_t reader)
 	if (reader->blocks) {
 		avro_free(reader->blocks,
 			reader->block_capacity * sizeof(struct avro_file_block_descriptor_t));
+	}
+	if (reader->prefix) {
+		avro_free(reader->prefix, reader->prefix_size);
 	}
 	avro_value_decref(&reader->meta);
 	avro_value_iface_decref(reader->meta_iface);
